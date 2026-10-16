@@ -4,9 +4,10 @@ Corre en GitHub Actions: cada ejecucion escucha mensajes ~4,6 min y se relanza s
 El archivo de estado (cartera, alertas, usuarios) se guarda CIFRADO con una clave
 derivada de tu TELEGRAM_TOKEN, para que no sea legible aunque el repositorio sea publico.
 """
-import os, io, re, json, math, time, html, base64, hashlib
+import os, io, re, sys, json, math, time, html, base64, hashlib, signal, threading
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
 import requests
@@ -21,7 +22,13 @@ except ImportError:  # se comprueba en main()
     Fernet = None
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "270"))
+RUN_SECONDS = int(os.getenv("RUN_SECONDS", "270"))   # 0 = funcionar sin parar (para un hosting)
+STATE_KEY = os.getenv("STATE_KEY") or TOKEN          # clave que cifra el estado
+TZ_H = float(os.getenv("BOT_TZ_OFFSET", "-4"))       # hora de Venezuela (UTC-4)
+TZ = timezone(timedelta(hours=TZ_H))
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")   # opcional: guarda el estado fuera del servidor
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+REMOTE = bool(SUPABASE_URL and SUPABASE_KEY)
 DATA = "https://data-api.binance.vision"      # precios publicos de Binance
 DEX = "https://api.dexscreener.com"           # memecoins (publico, sin clave)
 TG = f"https://api.telegram.org/bot{TOKEN}"
@@ -67,6 +74,19 @@ def esc(s):
     return html.escape(str(s))
 
 
+def safe(e):
+    """Quita el token de los mensajes de error (los registros pueden ser publicos)."""
+    s = str(e)
+    for secret in (TOKEN, SUPABASE_KEY):
+        if secret:
+            s = s.replace(secret, "***")
+    return s
+
+
+def safe_url(u):
+    return u if isinstance(u, str) and u.startswith("https://") else "https://dexscreener.com"
+
+
 def fp(p):
     if p >= 1000:
         return f"{p:,.2f}"
@@ -110,15 +130,49 @@ def tg(method, timeout=30, **data):
     try:
         return requests.post(f"{TG}/{method}", json=data, timeout=timeout).json()
     except Exception as e:
-        print("Telegram error:", e)
+        print("Telegram error:", safe(e))
         return {}
 
 
+def trim(text, n=3900):
+    """Recorta mensajes largos por una linea completa (asi no se rompe el HTML)."""
+    if len(text) <= n:
+        return text
+    cut = text.rfind("\n", 0, n)
+    return text[:cut if cut > 0 else n] + "\n…"
+
+
 def send(chat, text, buttons=None):
-    data = {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
+    text = trim(text)
+    data = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if buttons:
         data["reply_markup"] = {"inline_keyboard": buttons}
-    return tg("sendMessage", **data)
+    r = {}
+    for _ in range(3):
+        r = tg("sendMessage", **data)
+        if r.get("ok") is not False:
+            break
+        code, desc = r.get("error_code"), str(r.get("description", ""))
+        if code == 429:   # Telegram pide esperar un momento
+            time.sleep(min(int((r.get("parameters") or {}).get("retry_after", 2)), 10))
+        elif code == 400 and "parse entities" in desc and "parse_mode" in data:
+            data["text"] = html.unescape(re.sub(r"<[^>]+>", "", text))   # reenviar como texto simple
+            data.pop("parse_mode")
+        else:
+            break
+    return r
+
+
+def dead_chat(r):
+    """True solo si el usuario bloqueó el bot o el chat ya no existe."""
+    if not r or r.get("ok") is not False:
+        return False
+    return r.get("error_code") == 403 or "chat not found" in str(r.get("description", "")).lower()
+
+
+def notify(state, chat, text, buttons=None):
+    if dead_chat(send(chat, text, buttons)) and chat in state["subs"]:
+        state["subs"].remove(chat)
 
 
 def send_photo(chat, png, caption="", buttons=None):
@@ -129,7 +183,7 @@ def send_photo(chat, png, caption="", buttons=None):
         return requests.post(f"{TG}/sendPhoto", data=data, files={"photo": ("g.png", png, "image/png")},
                              timeout=60).json()
     except Exception as e:
-        print("Foto error:", e)
+        print("Foto error:", safe(e))
         return {}
 
 
@@ -160,18 +214,61 @@ BOT_COMMANDS = [
 
 # ------------------------- estado (cifrado) -------------------------
 def _fernet():
-    if Fernet is None or not TOKEN:
+    if Fernet is None or not STATE_KEY:
         return None
-    key = base64.urlsafe_b64encode(hashlib.sha256(("estado:" + TOKEN).encode()).digest())
+    key = base64.urlsafe_b64encode(hashlib.sha256(("estado:" + STATE_KEY).encode()).digest())
     return Fernet(key)
+
+
+def _sb_headers():
+    h = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+    if not SUPABASE_KEY.startswith("sb_"):   # las llaves nuevas (sb_...) no llevan Authorization
+        h["Authorization"] = "Bearer " + SUPABASE_KEY
+    return h
+
+
+def remote_load():
+    """(ok, datos). ok=False si no se pudo leer: en ese caso NO se debe arrancar de cero."""
+    for _ in range(3):
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/bot_state", params={"id": "eq.main", "select": "data"},
+                             headers=_sb_headers(), timeout=15)
+            if r.status_code == 200:
+                rows = r.json()
+                return True, (rows[0]["data"].encode() if rows else None)
+            print("Supabase leer:", r.status_code, r.text[:120])
+        except Exception as e:
+            print("Supabase leer error:", safe(e))
+        time.sleep(2)
+    return False, None
+
+
+def remote_save(raw):
+    try:
+        h = _sb_headers()
+        h["Prefer"] = "resolution=merge-duplicates"
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/bot_state", headers=h,
+                          json={"id": "main", "data": raw.decode()}, timeout=15)
+        if r.status_code in (200, 201, 204):
+            return True
+        print("Supabase guardar:", r.status_code, r.text[:120])
+    except Exception as e:
+        print("Supabase guardar error:", safe(e))
+    return False
 
 
 def load_state():
     base = {"offset": 0, "subs": [], "prefs": {}, "alerts": [], "next_id": 1, "snaps": [], "cool": {},
             "last": {}, "port": {}, "watch": {}, "daily": ""}
-    if os.path.exists(STATE_FILE):
+    raw = None
+    if REMOTE:
+        ok, raw = remote_load()
+        if not ok:
+            raise SystemExit("No pude leer el estado de Supabase; no arranco para no borrar tus datos.")
+    if raw is None and os.path.exists(STATE_FILE):   # primera vez con Supabase: migra el archivo local
         with open(STATE_FILE, "rb") as f:
             raw = f.read()
+    if raw:
         data, fer = None, _fernet()
         if fer:
             try:
@@ -183,20 +280,37 @@ def load_state():
                 data = json.loads(raw)   # formato viejo sin cifrar (se cifra al guardar)
             except Exception:
                 data = None
+        if data is None and raw.strip():   # ilegible (¿clave distinta?): guardar copia antes de empezar de cero
+            try:
+                with open(STATE_FILE + ".corrupto", "wb") as f:
+                    f.write(raw)
+            except OSError:
+                pass
         if isinstance(data, dict):
             base.update(data)
     return base
 
 
-def save_state(s):
+_saved = {"h": None, "t": 0.0}
+
+
+def save_state(s, force=False):
+    """Guarda solo si algo cambió. Con Supabase: máximo una vez cada 10 s (y siempre al apagar)."""
     now = time.time()
     s["cool"] = {k: v for k, v in s["cool"].items() if now - v < 172800}
+    h = hashlib.sha256(json.dumps({k: v for k, v in s.items() if k != "last"}, sort_keys=True).encode()).hexdigest()
+    if not force and h == _saved["h"]:
+        return
     raw = json.dumps(s).encode()
     fer = _fernet()
     if fer:
         raw = fer.encrypt(raw)
     with open(STATE_FILE, "wb") as f:
         f.write(raw)
+    if not REMOTE:
+        _saved["h"] = h
+    elif (force or now - _saved["t"] >= 10) and remote_save(raw):
+        _saved.update(h=h, t=now)
 
 
 def pref(state, chat):
@@ -220,8 +334,7 @@ def broadcast(state, kind, text, buttons=None, photo=None):
             continue
         if photo:
             send_photo(chat, photo, "")
-        r = send(chat, text, buttons)
-        if r and r.get("ok") is False and r.get("error_code") in (400, 403):
+        if dead_chat(send(chat, text, buttons)):
             state["subs"].remove(chat)
 
 
@@ -272,7 +385,7 @@ def klines(sym, interval, limit):
 
 
 def klines_many(syms, interval, limit):
-    with ThreadPoolExecutor(8) as ex:
+    with ThreadPoolExecutor(6) as ex:
         res = list(ex.map(lambda s: klines(s, interval, limit), syms))
     return dict(zip(syms, res))
 
@@ -343,7 +456,9 @@ def _labels(ax, kl, interval):
     step = max(1, len(kl) // 6)
     idx = list(range(0, len(kl), step))
     ax.set_xticks(idx)
-    ax.set_xticklabels([datetime.fromtimestamp(kl[i]["t"], timezone.utc).strftime(fmt) for i in idx])
+    ax.set_xticklabels([datetime.fromtimestamp(kl[i]["t"], TZ).strftime(fmt) for i in idx])
+    if interval != "1d":
+        ax.set_xlabel(f"hora UTC{TZ_H:+g}" + (" (Venezuela)" if TZ_H == -4 else ""), color=FG, fontsize=8)
 
 
 def to_png(fig):
@@ -647,7 +762,7 @@ def news(n=6):
     items = []
     for name, url in FEEDS:
         raw = get_bytes(url)
-        if not raw:
+        if not raw or len(raw) > 2_000_000:
             continue
         try:
             root = ET.fromstring(raw)
@@ -816,7 +931,7 @@ def cmd_memes(state, chat, args):
     if not res:
         return send(chat, "Ninguna memecoin pasó los filtros ahora mismo. Eso es normal: casi todas son riesgo alto.")
     for p, flags, age_h in res[:5]:
-        send(chat, meme_text(p, flags, age_h), [[btn("Ver en DexScreener", url=p.get("url", "https://dexscreener.com"))]])
+        send(chat, meme_text(p, flags, age_h), [[btn("Ver en DexScreener", url=safe_url(p.get("url")))]])
     send(chat, "🛡 Filtros: liquidez ≥ 30K, volumen ≥ 50K, ≥ 200 operaciones, que se pueda vender y ≥ 6 h de vida.\n"
                "Pasar los filtros NO significa que sea segura. Muchas memecoins caen a cero. "
                "Si decides entrar, usa solo dinero que puedas perder.")
@@ -884,7 +999,8 @@ def cmd_cartera(state, chat, args):
             continue
         val = h["qty"] * p["price"]
         total += val
-        day += val - val / (1 + p["chg"] / 100)
+        if p["chg"] > -99.9:
+            day += val - val / (1 + p["chg"] / 100)
         pnl = None
         if h.get("cost"):
             cost_total += h["qty"] * h["cost"]
@@ -966,7 +1082,7 @@ def cmd_convertir(state, chat, args):
     usd = amt * pa
     res = usd / pb
     shown = f"{res:,.2f}" if res >= 1000 else fp(res)
-    send(chat, f"💱 {fq(amt)} <b>{a.upper()}</b> = <b>{shown} {b.upper()}</b>\n"
+    send(chat, f"💱 {fq(amt)} <b>{esc(a.upper())}</b> = <b>{shown} {esc(b.upper())}</b>\n"
                f"(≈ ${usd:,.2f}). Precio de referencia de Binance; al operar hay comisiones.")
 
 
@@ -1205,7 +1321,7 @@ def task_movers(state):
     snaps = state["snaps"]
     ref = None
     for s in snaps:
-        if now - s["t"] >= 2700:
+        if 2700 <= now - s["t"] <= 5400:
             ref = s
     if ref and state["subs"]:
         mins = int((now - ref["t"]) / 60)
@@ -1226,8 +1342,8 @@ def task_movers(state):
                 for c in targets:
                     per.setdefault(c, []).append(line)
         for c, lines in per.items():
-            send(c, "⚡ <b>Movimientos fuertes</b>\n" + "\n".join(lines[:5]) +
-                 "\n\nVer gráfico: /grafico MONEDA. " + DISCLAIMER)
+            notify(state, c, "⚡ <b>Movimientos fuertes</b>\n" + "\n".join(lines[:5]) +
+                   "\n\nVer gráfico: /grafico MONEDA. " + DISCLAIMER)
     if not snaps or now - snaps[-1]["t"] >= 900:
         top = sorted(mk, key=lambda x: x["qv"], reverse=True)[:200]
         snaps.append({"t": now, "p": {x["sym"]: x["price"] for x in top}})
@@ -1255,14 +1371,14 @@ def task_memes(state):
         if sent < 3 and cooled(state, f"meme:{p.get('chainId')}:{b.get('address')}", 24):
             broadcast(state, "memes", "🐸 <b>Memecoin con actividad</b>\n" + meme_text(p, flags, age_h) +
                       "\n\n🛡 Pasó los filtros básicos, pero eso NO la hace segura.",
-                      [[btn("Ver en DexScreener", url=p.get("url", "https://dexscreener.com"))]])
+                      [[btn("Ver en DexScreener", url=safe_url(p.get("url")))]])
             sent += 1
 
 
 def task_daily(state):
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
-    if now.hour < DAILY_HOUR_UTC or state.get("daily") == today:
+    if not (DAILY_HOUR_UTC <= now.hour < DAILY_HOUR_UTC + 3) or state.get("daily") == today:
         return
     state["daily"] = today
     if not any(pref(state, c)["daily"] for c in state["subs"]):
@@ -1300,8 +1416,12 @@ def poll(state, timeout):
         r = requests.post(f"{TG}/getUpdates", json={"offset": state["offset"], "timeout": timeout,
                           "allowed_updates": ["message", "callback_query"]}, timeout=timeout + 15).json()
     except Exception as e:
-        print("getUpdates error:", e)
+        print("getUpdates error:", safe(e))
         time.sleep(3)
+        return
+    if not r.get("ok"):   # p. ej. 409 (otra copia del bot activa) o 429: esperar, no martillar
+        print("getUpdates no ok:", r.get("error_code"), str(r.get("description"))[:120])
+        time.sleep(min(int((r.get("parameters") or {}).get("retry_after", 5)), 30))
         return
     for u in r.get("result", []):
         state["offset"] = u["update_id"] + 1
@@ -1315,20 +1435,43 @@ def poll(state, timeout):
                 handle(state, cq["message"]["chat"]["id"], data[4:])
 
 
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Cripdex activo")
+
+    def log_message(self, *a):
+        pass
+
+
+def start_health():
+    """Algunos hostings exigen que el programa responda en un puerto (variable PORT)."""
+    port = os.getenv("PORT")
+    if port:
+        srv = HTTPServer(("0.0.0.0", int(port)), _Health)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
 def main():
     if not TOKEN:
         raise SystemExit("Falta el secreto TELEGRAM_TOKEN.")
     if Fernet is None:
         raise SystemExit("Falta instalar 'cryptography' (revisa el paso pip install del workflow).")
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))   # asi el estado se guarda al detenerlo
+    start_health()
     state = load_state()
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in BOT_COMMANDS])
-    end = time.time() + RUN_SECONDS
+    forever = RUN_SECONDS <= 0
+    end = float("inf") if forever else time.time() + RUN_SECONDS
     try:
         while time.time() < end:
             run_tasks(state)
-            poll(state, max(1, min(20, int(end - time.time()))))
+            left = 20 if forever else int(end - time.time())
+            poll(state, max(1, min(20, left)))
+            save_state(state)
     finally:
-        save_state(state)
+        save_state(state, force=True)
 
 
 if __name__ == "__main__":
