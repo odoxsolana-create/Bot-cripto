@@ -1,0 +1,36 @@
+name: bot-telegram
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bot-telegram
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests matplotlib
+      - name: Ejecutar bot
+        run: python telegram_bot.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          RUN_SECONDS: "280"
+      - name: Guardar estado
+        if: always()
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add telegram_state.json
+          git diff --cached --quiet || (git commit -m "estado telegram" && git pull --rebase -q && git push)
