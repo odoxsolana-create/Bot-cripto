@@ -32,7 +32,7 @@ REMOTE = bool(SUPABASE_URL and SUPABASE_KEY)
 DATA = "https://data-api.binance.vision"      # precios publicos de Binance
 DEX = "https://api.dexscreener.com"           # memecoins (publico, sin clave)
 TG = f"https://api.telegram.org/bot{TOKEN}"
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telegram_state.json")
+STATE_FILE = os.getenv("STATE_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "telegram_state.json")
 UA = {"User-Agent": "Mozilla/5.0"}
 
 MOVER_MIN = 3.0            # el bot detecta movimientos desde +-3% (cada usuario elige su umbral)
@@ -1435,14 +1435,27 @@ def poll(state, timeout):
                 handle(state, cq["message"]["chat"]["id"], data[4:])
 
 
+_beat = {"t": time.time()}   # última vez que el bucle principal dio señales de vida
+
+
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
+        ok = time.time() - _beat["t"] < 300   # si el bot se congeló, avisa con error 503
+        self.send_response(200 if ok else 503)
         self.end_headers()
-        self.wfile.write(b"Cripdex activo")
+        self.wfile.write(b"Cripdex activo" if ok else b"Cripdex sin respuesta")
 
     def log_message(self, *a):
         pass
+
+
+def _watchdog():
+    """Si el bucle principal lleva 10 min sin moverse, cierra el programa: el hosting lo reinicia solo."""
+    while True:
+        time.sleep(30)
+        if time.time() - _beat["t"] > 600:
+            print("Watchdog: el bot se congeló; reiniciando")
+            os._exit(1)
 
 
 def start_health():
@@ -1463,9 +1476,12 @@ def main():
     state = load_state()
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in BOT_COMMANDS])
     forever = RUN_SECONDS <= 0
+    if forever:
+        threading.Thread(target=_watchdog, daemon=True).start()
     end = float("inf") if forever else time.time() + RUN_SECONDS
     try:
         while time.time() < end:
+            _beat["t"] = time.time()
             run_tasks(state)
             left = 20 if forever else int(end - time.time())
             poll(state, max(1, min(20, left)))
