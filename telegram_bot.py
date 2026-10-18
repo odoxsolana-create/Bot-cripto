@@ -47,6 +47,10 @@ DISCLAIMER = "⚠️ Es información, no consejo financiero. Nadie puede garanti
 FEEDS = [("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
          ("Cointelegraph", "https://cointelegraph.com/rss")]
 DEFAULT_PREFS = {"mov_on": True, "mov": 5.0, "memes": True, "vol": True, "daily": True}
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)   # tu ID de Telegram (usa /miid para verlo)
+HEALTH = {"last_ok_save": 0.0, "save_fail_streak": 0, "last_error": "", "task_errors": 0,
+          "started": time.time()}
+OWNER_SENT = {}
 
 
 # ------------------------- utilidades -------------------------
@@ -250,11 +254,26 @@ def remote_save(raw):
         r = requests.post(f"{SUPABASE_URL}/rest/v1/bot_state", headers=h,
                           json={"id": "main", "data": raw.decode()}, timeout=15)
         if r.status_code in (200, 201, 204):
+            HEALTH.update(last_ok_save=time.time(), save_fail_streak=0, last_error="")
             return True
-        print("Supabase guardar:", r.status_code, r.text[:120])
+        msg = f"Supabase {r.status_code}: {r.text[:120]}"
     except Exception as e:
-        print("Supabase guardar error:", safe(e))
+        msg = "Supabase error: " + safe(e)
+    HEALTH["save_fail_streak"] += 1
+    HEALTH["last_error"] = msg[:300]
+    print(msg)
     return False
+
+
+def notify_owner(key, text):
+    """Avisa al administrador por Telegram, como mucho una vez cada 30 min por tipo de aviso."""
+    if not OWNER_ID:
+        return
+    now = time.time()
+    if now - OWNER_SENT.get(key, 0) < 1800:
+        return
+    OWNER_SENT[key] = now
+    send(OWNER_ID, text)
 
 
 def load_state():
@@ -309,8 +328,12 @@ def save_state(s, force=False):
         f.write(raw)
     if not REMOTE:
         _saved["h"] = h
-    elif (force or now - _saved["t"] >= 10) and remote_save(raw):
-        _saved.update(h=h, t=now)
+    elif force or now - _saved["t"] >= 10:
+        if remote_save(raw):
+            _saved.update(h=h, t=now)
+        elif HEALTH["save_fail_streak"] >= 3:
+            notify_owner("save", "⚠️ <b>Cripdex no puede guardar en la nube.</b>\n"
+                         + esc(HEALTH["last_error"]) + "\nRevisa SUPABASE_URL y SUPABASE_KEY en Render.")
 
 
 def pref(state, chat):
@@ -572,7 +595,8 @@ def cmd_ayuda(state, chat, args):
                "<b>🧰 Herramientas</b>\n"
                "/convertir · /ganancia · /riesgo · /dca (mira /herramientas)\n\n"
                "<b>🔔 Avisos</b>\n"
-               "/suscribir · /config · /umbral 5 · /silenciar\n\n" + DISCLAIMER, MENU)
+               "/suscribir · /config · /umbral 5 · /silenciar\n"
+               "<i>Admin:</i> /estado · /miid\n\n" + DISCLAIMER, MENU)
 
 
 def cmd_herramientas(state, chat, args):
@@ -1257,6 +1281,29 @@ def cmd_umbral(state, chat, args):
     send(chat, f"✅ Te avisaré de movimientos desde ±{v:g}% en ~1 hora.")
 
 
+def cmd_miid(state, chat, args):
+    send(chat, f"Tu ID de Telegram es <code>{chat}</code>.\nPónlo en Render como OWNER_ID para recibir avisos de salud.")
+
+
+def cmd_estado(state, chat, args):
+    if not OWNER_ID:
+        return send(chat, "Aún no hay administrador. Usa /miid, copia tu ID y ponlo en Render como OWNER_ID.")
+    if chat != OWNER_ID:
+        return send(chat, "Este comando es solo para el administrador.")
+    last = HEALTH["last_ok_save"]
+    ago = f"hace {int((time.time() - last) / 60)} min" if last else "nunca"
+    up = int((time.time() - HEALTH["started"]) / 60)
+    send(chat, "🩺 <b>Estado de Cripdex</b>\n"
+               f"Encendido hace {up} min\n"
+               f"Suscriptores: {len(state['subs'])}\n"
+               f"Carteras guardadas: {len(state['port'])}\n"
+               f"Alertas de precio: {len(state['alerts'])}\n"
+               f"Último guardado en la nube: {ago}\n"
+               f"Fallos de guardado seguidos: {HEALTH['save_fail_streak']}\n"
+               f"Último error: {esc(HEALTH['last_error']) or 'ninguno'}\n"
+               f"Errores en tareas automáticas: {HEALTH['task_errors']}")
+
+
 COMMANDS = {"/start": cmd_start, "/menu": cmd_start, "/ayuda": cmd_ayuda, "/help": cmd_ayuda,
             "/herramientas": cmd_herramientas, "/top": cmd_top, "/heatmap": cmd_heatmap,
             "/precio": cmd_precio, "/grafico": cmd_grafico, "/analisis": cmd_analisis,
@@ -1267,7 +1314,7 @@ COMMANDS = {"/start": cmd_start, "/menu": cmd_start, "/ayuda": cmd_ayuda, "/help
             "/ganancia": cmd_ganancia, "/riesgo": cmd_riesgo, "/dca": cmd_dca,
             "/alerta": cmd_alerta, "/alertas": cmd_alertas, "/borrar": cmd_borrar,
             "/suscribir": cmd_suscribir, "/silenciar": cmd_silenciar, "/config": cmd_config,
-            "/toggle": cmd_toggle, "/umbral": cmd_umbral}
+            "/toggle": cmd_toggle, "/umbral": cmd_umbral, "/estado": cmd_estado, "/miid": cmd_miid}
 
 _hits = {}
 
@@ -1378,23 +1425,24 @@ def task_memes(state):
 def task_daily(state):
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
-    if not (DAILY_HOUR_UTC <= now.hour < DAILY_HOUR_UTC + 3) or state.get("daily") == today:
+    if not (DAILY_HOUR_UTC <= now.hour < 23) or state.get("daily") == today:
         return
-    state["daily"] = today
     if not any(pref(state, c)["daily"] for c in state["subs"]):
+        state["daily"] = today
         return
     mk = market()
     parts = ["🌅 <b>Resumen del día</b>\n", market_summary()]
     if mk:
-        s = sorted(mk, key=lambda x: x["chg"], reverse=True)
-        parts.append("\n🚀 Lideran: " + " · ".join(f"<b>{x['base']}</b> {x['chg']:+.1f}%" for x in s[:3]))
-        parts.append("💥 Más caen: " + " · ".join(f"<b>{x['base']}</b> {x['chg']:+.1f}%" for x in s[-3:][::-1]))
+        s_ = sorted(mk, key=lambda x: x["chg"], reverse=True)
+        parts.append("\n🚀 Lideran: " + " · ".join(f"<b>{x['base']}</b> {x['chg']:+.1f}%" for x in s_[:3]))
+        parts.append("💥 Más caen: " + " · ".join(f"<b>{x['base']}</b> {x['chg']:+.1f}%" for x in s_[-3:][::-1]))
     items = news(3)
     if items:
         parts.append("\n📰 <b>Titulares</b> (en inglés)\n" + "\n".join(news_lines(items)))
     parts.append("\n" + DISCLAIMER)
     png = chart_heatmap(sorted(mk, key=lambda x: x["qv"], reverse=True)[:30]) if mk else None
     broadcast(state, "daily", "\n".join(parts), [[btn("📈 Top", "/top"), btn("🔍 Escáner", "/escaner")]], photo=png)
+    state["daily"] = today
 
 
 def run_tasks(state):
@@ -1407,6 +1455,7 @@ def run_tasks(state):
             try:
                 fn(state)
             except Exception as e:
+                HEALTH["task_errors"] += 1
                 print("Error en tarea", name, repr(e))
 
 
@@ -1440,7 +1489,7 @@ _beat = {"t": time.time()}   # última vez que el bucle principal dio señales d
 
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
-        ok = time.time() - _beat["t"] < 300   # si el bot se congeló, avisa con error 503
+        ok = time.time() - _beat["t"] < 300 and HEALTH["save_fail_streak"] < 10   # 503 = algo va mal
         self.send_response(200 if ok else 503)
         self.end_headers()
         self.wfile.write(b"Cripdex activo" if ok else b"Cripdex sin respuesta")
@@ -1474,6 +1523,9 @@ def main():
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))   # asi el estado se guarda al detenerlo
     start_health()
     state = load_state()
+    if not OWNER_ID:
+        print("Aviso: falta OWNER_ID en Render (usa /miid para verlo)")
+    notify_owner("start", f"✅ Cripdex arrancó. Suscriptores: {len(state['subs'])}.")
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in BOT_COMMANDS])
     forever = RUN_SECONDS <= 0
     if forever:
