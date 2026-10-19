@@ -52,7 +52,8 @@ HEALTH = {"last_ok_save": 0.0, "save_fail_streak": 0, "last_error": "", "task_er
           "started": time.time()}
 OWNER_SENT = {}
 SESSION = requests.Session()   # conexión HTTP reutilizable: más rápido con Binance, Telegram y DexScreener
-SESSION.headers.update(UA)
+# OJO: no le pongas un User-Agent de navegador a la Session: Supabase rechaza sus llaves secretas si parece un navegador.
+SB_UA = "cripdex-bot/3 (servidor)"
 BOT = {"user": os.getenv("BOT_USERNAME", "").lstrip("@")}   # se completa solo con getMe
 BINANCE_REF_URL = os.getenv("BINANCE_REF_URL", "")          # tu enlace de referido de Binance (opcional)
 DAILY_P2P_FIAT = os.getenv("DAILY_P2P_FIAT", "VES")         # "" = sin línea de dólar P2P en el resumen diario
@@ -266,7 +267,7 @@ def _fernet():
 
 
 def _sb_headers():
-    h = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+    h = {"apikey": SUPABASE_KEY, "Content-Type": "application/json", "User-Agent": SB_UA}
     if not SUPABASE_KEY.startswith("sb_"):   # las llaves nuevas (sb_...) no llevan Authorization
         h["Authorization"] = "Bearer " + SUPABASE_KEY
     return h
@@ -1559,7 +1560,7 @@ def p2p_side(fiat, side):
             "proMerchantAds": False, "shieldMerchantAds": False, "publisherType": None, "payTypes": []}
     rows = []
     try:
-        r = SESSION.post(P2P_URL, json=body, timeout=15)
+        r = SESSION.post(P2P_URL, json=body, timeout=15, headers=UA)
         if r.status_code == 200:
             rows = r.json().get("data") or []
         else:
@@ -2325,7 +2326,11 @@ def main():
         raise SystemExit("Falta instalar 'cryptography' (revisa el paso pip install del workflow).")
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))   # asi el estado se guarda al detenerlo
     start_health()
-    state = load_state()
+    try:
+        state = load_state()
+    except SystemExit as e:
+        notify_owner("load", f"🛑 Cripdex no pudo arrancar: {e}")
+        raise
     me = (tg("getMe") or {}).get("result") or {}
     if me.get("username") and not BOT["user"]:
         BOT["user"] = me["username"]
