@@ -48,7 +48,7 @@ FEEDS = [("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
          ("Cointelegraph", "https://cointelegraph.com/rss")]
 DEFAULT_PREFS = {"mov_on": True, "mov": 5.0, "memes": True, "vol": True, "daily": True}
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)   # tu ID de Telegram (usa /miid para verlo)
-HEALTH = {"last_ok_save": 0.0, "save_fail_streak": 0, "last_error": "", "task_errors": 0,
+HEALTH = {"last_backup": "", "last_ok_save": 0.0, "save_fail_streak": 0, "last_error": "", "task_errors": 0,
           "started": time.time()}
 OWNER_SENT = {}
 SESSION = requests.Session()   # conexión HTTP reutilizable: más rápido con Binance, Telegram y DexScreener
@@ -57,6 +57,9 @@ SB_UA = "cripdex-bot/3 (servidor)"
 BOT = {"user": os.getenv("BOT_USERNAME", "").lstrip("@")}   # se completa solo con getMe
 BINANCE_REF_URL = os.getenv("BINANCE_REF_URL", "")          # tu enlace de referido de Binance (opcional)
 DAILY_P2P_FIAT = os.getenv("DAILY_P2P_FIAT", "VES")         # "" = sin línea de dólar P2P en el resumen diario
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")   # tu canal público (@nombre o -100…): ahí se publica el resumen diario
+LOCAL_FIAT = os.getenv("LOCAL_FIAT", "VES")   # moneda local para mostrar precios (""= no mostrar)
+BACKUP_DAYS = 7               # copias diarias que se conservan en Supabase
 P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 P2P_FIATS = ["VES", "ARS", "COP", "EUR", "MXN", "BRL", "PEN", "CLP", "USD"]
 FIAT_SYMBOL = {"VES": "Bs", "ARS": "AR$", "COP": "COL$", "EUR": "€", "MXN": "MX$", "BRL": "R$",
@@ -251,7 +254,8 @@ BOT_COMMANDS = [
     ("noticias", "Últimas noticias cripto"), ("mercado", "Ánimo general del mercado"),
     ("cartera", "Tu cartera y ganancias"), ("agregar", "Agregar una moneda a tu cartera"),
     ("meta", "Tu meta de cartera con barra de progreso"), ("tarjeta", "Imagen de tu cartera para compartir"),
-    ("lista", "Tu lista de seguimiento"), ("alerta", "Alerta de precio"), ("alertap2p", "Alerta del dólar P2P"),
+    ("historial", "Cómo ha cambiado el valor de tu cartera"),
+    ("lista", "Tu lista de seguimiento"), ("alerta", "Alerta de precio"), ("alertap2p", "Alerta del dólar P2P"), ("alertarsi", "Alerta cuando el RSI llegue a un nivel"),
     ("config", "Configurar tus avisos"), ("glosario", "Qué significa cada término"),
     ("herramientas", "Calculadoras y simulador DCA"), ("pro", "Tu plan y límites"),
     ("terminos", "Términos y privacidad"), ("ayuda", "Todos los comandos"),
@@ -294,7 +298,8 @@ def remote_save(raw):
         h = _sb_headers()
         h["Prefer"] = "resolution=merge-duplicates"
         r = SESSION.post(f"{SUPABASE_URL}/rest/v1/bot_state", headers=h,
-                          json={"id": "main", "data": raw.decode()}, timeout=15)
+                          json={"id": "main", "data": raw.decode(),
+                                "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=15)
         if r.status_code in (200, 201, 204):
             HEALTH.update(last_ok_save=time.time(), save_fail_streak=0, last_error="")
             return True
@@ -318,10 +323,43 @@ def notify_owner(key, text):
     send(OWNER_ID, text)
 
 
+def remote_backup(raw, day):
+    """Copia diaria cifrada en la misma tabla (id backup-AAAA-MM-DD). Conserva los últimos BACKUP_DAYS días."""
+    try:
+        h = _sb_headers()
+        h["Prefer"] = "resolution=merge-duplicates"
+        r = SESSION.post(f"{SUPABASE_URL}/rest/v1/bot_state", headers=h,
+                         json={"id": f"backup-{day}", "data": raw.decode(),
+                               "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=15)
+        if r.status_code not in (200, 201, 204):
+            print("Supabase copia:", r.status_code, r.text[:120])
+            return False
+        cutoff = (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=BACKUP_DAYS - 1)).strftime("%Y-%m-%d")
+        SESSION.delete(f"{SUPABASE_URL}/rest/v1/bot_state", headers=_sb_headers(), timeout=15,
+                       params=[("id", "like.backup-*"), ("id", f"lt.backup-{cutoff}")])
+        HEALTH["last_backup"] = day
+        return True
+    except Exception as e:
+        print("Supabase copia error:", safe(e))
+        return False
+
+
+def remote_backups():
+    try:
+        r = SESSION.get(f"{SUPABASE_URL}/rest/v1/bot_state", headers=_sb_headers(), timeout=15,
+                        params=[("select", "id"), ("id", "like.backup-*"), ("order", "id.desc")])
+        if r.status_code == 200:
+            return [x["id"][7:] for x in r.json()]
+    except Exception as e:
+        print("Supabase copias error:", safe(e))
+    return None
+
+
 def load_state():
     base = {"offset": 0, "subs": [], "prefs": {}, "alerts": [], "next_id": 1, "snaps": [], "cool": {},
             "last": {}, "port": {}, "watch": {}, "daily": "",
-            "pro": {}, "goals": {}, "stats": {"cmds": {}, "seen": {}}}   # pro = {id_chat: vencimiento}
+            "pro": {}, "goals": {}, "stats": {"cmds": {}, "seen": {}},   # pro = {id_chat: vencimiento}
+            "hist": {}, "hist_day": "", "blocked": []}
     raw = None
     if REMOTE:
         ok, raw = remote_load()
@@ -355,7 +393,7 @@ def load_state():
     return base
 
 
-_saved = {"h": None, "t": 0.0}
+_saved = {"h": None, "t": 0.0, "bk": None, "bk_t": 0.0}
 
 
 def save_state(s, force=False):
@@ -376,6 +414,11 @@ def save_state(s, force=False):
     elif force or now - _saved["t"] >= 10:
         if remote_save(raw):
             _saved.update(h=h, t=now)
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if _saved["bk"] != day and now - _saved["bk_t"] > 600:   # una copia al día, sin insistir seguido
+                _saved["bk_t"] = now
+                if remote_backup(raw, day):
+                    _saved["bk"] = day
         elif HEALTH["save_fail_streak"] >= 3:
             notify_owner("save", "⚠️ <b>Cripdex no puede guardar en la nube.</b>\n"
                          + esc(HEALTH["last_error"]) + "\nRevisa SUPABASE_URL y SUPABASE_KEY en Render.")
@@ -707,20 +750,21 @@ def cmd_ayuda(state, chat, args):
                "/contrato DIRECCIÓN – revisión básica de un token\n\n"
                "<b>💼 Lo tuyo</b>\n"
                "/agregar BTC 0.01 65000 · /cartera · /quitar BTC\n"
-               "/meta 1000 · /tarjeta (imagen para compartir)\n"
+               "/meta 1000 · /tarjeta · /historial\n"
                "/seguir BTC ETH · /lista · /dejar BTC\n"
-               "/alerta BTC 70000 o /alerta BTC +5% · /alertas · /borrar 3\n\n"
+               "/alerta BTC 70000 o /alerta BTC +5% (+ «repetir») · /alertas · /borrar 3\n"
+               "/alertarsi ETH 70 1h – aviso cuando el RSI llegue a 70\n\n"
                "<b>🧰 Aprende y calcula</b>\n"
                "/glosario RSI · /convertir · /ganancia · /riesgo · /dca\n\n"
                "<b>🔔 Avisos y cuenta</b>\n"
                "/suscribir · /config · /umbral 5 · /silenciar\n"
                "/pro · /terminos · /borrar_mis_datos\n"
-               "<i>Admin:</i> /estado · /estadisticas · /darpro · /miid\n\n" + DISCLAIMER, MENU)
+               "<i>Admin:</i> /estado · /estadisticas · /respaldos · /darpro · /bloquear · /publicar · /miid\n\n" + DISCLAIMER, MENU)
 
 
 def cmd_herramientas(state, chat, args):
     send(chat, "🧰 <b>Herramientas</b>\n\n"
-               "💱 <b>/convertir 0.5 BTC</b>  o  /convertir 100 USD XRP\n"
+               "💱 <b>/convertir 0.5 BTC</b>  ·  /convertir 10 USD VES\n"
                "Convierte entre monedas y dólares.\n\n"
                "💰 <b>/ganancia 100 0.55 0.62</b>\n"
                "Cuánto ganas si inviertes 100 USDT comprando a 0.55 y vendiendo a 0.62 (ya con comisiones).\n\n"
@@ -770,7 +814,15 @@ def cmd_precio(state, chat, args):
     if not t:
         return send(chat, "No encuentro esa moneda en Binance. Prueba con BTC, ETH, SOL, XRP, DOGE…")
     pos = (t["price"] - t["lo"]) / (t["hi"] - t["lo"]) * 100 if t["hi"] > t["lo"] else 50
-    send(chat, f"💰 <b>{t['base']}/USDT</b>\nPrecio: <b>${fp(t['price'])}</b>\n24 h: {pc(t['chg'])}\n"
+    local = ""
+    if LOCAL_FIAT:
+        try:
+            m = p2p_mid(LOCAL_FIAT)
+        except Exception:
+            m = None
+        if m:
+            local = f"\n≈ <b>{FIAT_SYMBOL.get(LOCAL_FIAT, LOCAL_FIAT)} {t['price'] * m:,.2f}</b> (al dólar P2P de hoy)"
+    send(chat, f"💰 <b>{t['base']}/USDT</b>\nPrecio: <b>${fp(t['price'])}</b>{local}\n24 h: {pc(t['chg'])}\n"
                f"Máximo 24 h: ${fp(t['hi'])}\nMínimo 24 h: ${fp(t['lo'])}\n"
                f"Está al {pos:.0f}% de su rango de hoy (0% = mínimo, 100% = máximo)\n"
                f"Volumen 24 h: ${fm(t['qv'])}",
@@ -1179,6 +1231,7 @@ def cmd_cartera(state, chat, args):
             s += f"\n   compra ${fp(h['cost'])} → {pc(pnl)}"
         lines.append(s)
     lines.append(f"\n<b>Total: ${total:,.2f}</b>")
+    record_point(state, chat, total)
     lines.append(f"Hoy: {'🟢' if day >= 0 else '🔴'} {day:+,.2f} USDT")
     goal = state["goals"].get(str(chat))
     if goal:
@@ -1233,6 +1286,9 @@ def price_of(name, pr):
     n = name.upper()
     if n in USD_NAMES:
         return 1.0
+    if n in P2P_FIATS:   # moneda local: su valor en dólares según el USDT P2P de hoy
+        mid = p2p_mid(n)
+        return 1 / mid if mid else None
     p = pr.get(norm_base(n))
     return p["price"] if p else None
 
@@ -1252,8 +1308,10 @@ def cmd_convertir(state, chat, args):
     usd = amt * pa
     res = usd / pb
     shown = f"{res:,.2f}" if res >= 1000 else fp(res)
+    fiat = any(x.upper() in P2P_FIATS and x.upper() not in USD_NAMES for x in (a, b))
     send(chat, f"💱 {fq(amt)} <b>{esc(a.upper())}</b> = <b>{shown} {esc(b.upper())}</b>\n"
-               f"(≈ ${usd:,.2f}). Precio de referencia de Binance; al operar hay comisiones.")
+               f"(≈ ${usd:,.2f}). Precio de referencia de Binance; al operar hay comisiones."
+               + (" Para la moneda local usé el dólar P2P de hoy." if fiat else ""))
 
 
 def cmd_ganancia(state, chat, args):
@@ -1326,17 +1384,46 @@ def cmd_dca(state, chat, args):
 
 # ------------------------- alertas y avisos -------------------------
 def alert_label(a):
-    return f"USDT en {a['sym'][4:]} (P2P)" if a["sym"].startswith("P2P:") else a["sym"][:-4]
+    s_ = a["sym"]
+    if s_.startswith("P2P:"):
+        name = f"USDT en {s_[4:]} (P2P)"
+    elif s_.startswith("RSI:"):
+        _, sym_, iv = s_.split(":")
+        name = f"RSI de {sym_[:-4]} ({iv})"
+    else:
+        name = s_[:-4]
+    return name + (" 🔁" if a.get("repeat") else "")
 
 
 def alert_price(a, x):
-    return f"{x:,.2f}" if a["sym"].startswith("P2P:") else fp(x)
+    if a["sym"].startswith("P2P:"):
+        return f"{x:,.2f}"
+    if a["sym"].startswith("RSI:"):
+        return f"{x:g}"
+    return fp(x)
+
+
+def split_repeat(args):
+    """Si el último argumento es «repetir» (o «siempre»), la alerta avisa cada vez que se cruce."""
+    r = bool(args) and args[-1].lower() in ("repetir", "siempre")
+    return (args[:-1] if r else args), r
+
+
+def new_alert(state, chat, sym, target, d, repeat):
+    a = {"id": state["next_id"], "chat": chat, "sym": sym, "price": target, "dir": d}
+    if repeat:
+        a["repeat"] = True
+    state["alerts"].append(a)
+    state["next_id"] += 1
+    return a["id"]
 
 
 def cmd_alerta(state, chat, args):
+    args, repeat = split_repeat(args)
     if len(args) < 2:
         return send(chat, "Ejemplos:\n/alerta BTC 70000  (cuando llegue a ese precio)\n"
-                          "/alerta BTC +5%  (cuando suba 5% desde ahora)\n/alerta ETH -8%")
+                          "/alerta BTC +5%  (cuando suba 5% desde ahora)\n/alerta ETH -8%\n"
+                          "Agrega «repetir» al final para que avise cada vez que lo cruce.")
     sym = norm_sym(args[0])
     t = ticker(sym)
     if not t:
@@ -1350,16 +1437,17 @@ def cmd_alerta(state, chat, args):
     if sum(1 for x in state["alerts"] if x["chat"] == chat) >= plan_limit(state, chat, "alerts"):
         return send(chat, limit_msg(state, chat, "alerts") + " Borra alguna con /borrar número.")
     d = "up" if target > t["price"] else "down"
-    state["alerts"].append({"id": state["next_id"], "chat": chat, "sym": sym, "price": target, "dir": d})
-    send(chat, f"🔔 Alerta #{state['next_id']} lista: te aviso cuando {t['base']} "
-               f"{'suba hasta' if d == 'up' else 'baje hasta'} ${fp(target)} (ahora ${fp(t['price'])}).")
-    state["next_id"] += 1
+    aid = new_alert(state, chat, sym, target, d, repeat)
+    send(chat, f"🔔 Alerta #{aid} lista: te aviso cuando {t['base']} "
+               f"{'suba hasta' if d == 'up' else 'baje hasta'} ${fp(target)} (ahora ${fp(t['price'])})."
+               + (" Se repite cada vez que lo cruce." if repeat else ""))
 
 
 def cmd_alertap2p(state, chat, args):
+    args, repeat = split_repeat(args)
     if len(args) < 2:
         return send(chat, "Ejemplos:\n/alertap2p VES 45.5  (cuando el USDT llegue a ese precio)\n"
-                          "/alertap2p VES +3%  (cuando suba 3% desde ahora)\n/alertap2p ARS -2%")
+                          "/alertap2p VES +3%  (cuando suba 3% desde ahora)\n/alertap2p ARS -2% repetir")
     fiat = args[0].upper()
     if fiat not in P2P_FIATS:
         return send(chat, "Moneda no disponible. Opciones: " + ", ".join(P2P_FIATS))
@@ -1375,17 +1463,45 @@ def cmd_alertap2p(state, chat, args):
     if sum(1 for x in state["alerts"] if x["chat"] == chat) >= plan_limit(state, chat, "alerts"):
         return send(chat, limit_msg(state, chat, "alerts") + " Borra alguna con /borrar número.")
     d = "up" if target > mid else "down"
-    state["alerts"].append({"id": state["next_id"], "chat": chat, "sym": f"P2P:{fiat}", "price": target, "dir": d})
-    send(chat, f"🔔 Alerta #{state['next_id']} lista: te aviso cuando el USDT en {fiat} "
-               f"{'suba hasta' if d == 'up' else 'baje hasta'} {target:,.2f} (ahora {mid:,.2f}).")
-    state["next_id"] += 1
+    aid = new_alert(state, chat, f"P2P:{fiat}", target, d, repeat)
+    send(chat, f"🔔 Alerta #{aid} lista: te aviso cuando el USDT en {fiat} "
+               f"{'suba hasta' if d == 'up' else 'baje hasta'} {target:,.2f} (ahora {mid:,.2f})."
+               + (" Se repite cada vez que lo cruce." if repeat else ""))
+
+
+def cmd_alertarsi(state, chat, args):
+    args, repeat = split_repeat(args)
+    if len(args) < 2:
+        return send(chat, "Ejemplos:\n/alertarsi ETH 70  (avisa cuando el RSI de ETH llegue a 70)\n/alertarsi BTC 30 4h repetir\n\n"
+                          "El RSI mide si una moneda está muy comprada (sobre 70) o muy vendida (bajo 30). "
+                          "Intervalos: 15m, 1h, 4h, 1d. Lo reviso cada 5 minutos.")
+    sym = norm_sym(args[0])
+    iv = args[2].lower() if len(args) > 2 else "1h"
+    if iv not in INTERVALS:
+        return send(chat, "Intervalos válidos: 15m, 1h, 4h, 1d")
+    try:
+        target = num(args[1])
+        assert 1 <= target <= 99
+    except Exception:
+        return send(chat, "El RSI va de 1 a 99. Ejemplo: /alertarsi ETH 70")
+    kl = klines(sym, iv, 100)
+    cur = rsi([k["c"] for k in kl]) if kl else None
+    if cur is None:
+        return send(chat, "No encuentro esa moneda en Binance.")
+    if sum(1 for x in state["alerts"] if x["chat"] == chat) >= plan_limit(state, chat, "alerts"):
+        return send(chat, limit_msg(state, chat, "alerts") + " Borra alguna con /borrar número.")
+    d = "up" if target > cur else "down"
+    aid = new_alert(state, chat, f"RSI:{sym}:{iv}", target, d, repeat)
+    send(chat, f"🔔 Alerta #{aid} lista: te aviso cuando el RSI de {sym[:-4]} ({iv}) "
+               f"{'suba hasta' if d == 'up' else 'baje hasta'} {target:g} (ahora {cur:.0f})."
+               + (" Se repite cada vez que lo cruce." if repeat else ""))
 
 
 def cmd_alertas(state, chat, args):
     mine = [a for a in state["alerts"] if a["chat"] == chat]
     if not mine:
-        return send(chat, "No tienes alertas. Crea una: /alerta BTC 70000 o /alertap2p VES +3%")
-    send(chat, "🔔 <b>Tus alertas</b>\n" + "\n".join(
+        return send(chat, "No tienes alertas. Crea una: /alerta BTC 70000, /alertap2p VES +3% o /alertarsi ETH 70")
+    send(chat, "🔔 <b>Tus alertas</b> (🔁 = se repite)\n" + "\n".join(
         f"#{a['id']} {alert_label(a)} {'≥' if a['dir'] == 'up' else '≤'} {alert_price(a, a['price'])}" for a in mine)
          + f"\nBorrar: /borrar número · Usas {len(mine)} de {plan_limit(state, chat, 'alerts')}")
 
@@ -1514,7 +1630,7 @@ def cmd_terminos(state, chat, args):
     send(chat, "📜 <b>Términos y privacidad</b>\n\n"
                "• Cripdex <b>solo informa</b>. No es asesoría financiera ni garantiza ganancias. Invierte solo lo que puedas perder.\n"
                "• Los datos vienen de terceros (Binance, DexScreener, GoPlus, RugCheck, DolarAPI, OKX y otros) y pueden tardar, fallar o ser inexactos.\n"
-               "• Guardo, cifrados: tu ID de chat, tus avisos, tu cartera, tu lista, tus alertas, tu meta y la fecha de tu última visita.\n"
+               "• Guardo, cifrados: tu ID de chat, tus avisos, tu cartera, tu lista, tus alertas, tu meta, el valor diario de tu cartera (para tu historial) y la fecha de tu última visita.\n"
                "• No guardo contraseñas ni claves de ningún exchange. Nunca las compartas con nadie.\n"
                "• Algunos enlaces pueden ser de referido: el botón lo dice, y a ti no te cuesta más.\n"
                "• Puedes borrar todo cuando quieras con /borrar_mis_datos.")
@@ -1522,11 +1638,11 @@ def cmd_terminos(state, chat, args):
 
 def cmd_borrar_mis_datos(state, chat, args):
     if not args or args[0].lower() != "si":
-        return send(chat, "⚠️ Esto borra <b>todo</b> lo tuyo: cartera, lista, alertas, meta, avisos y plan Pro. No se puede deshacer.",
+        return send(chat, "⚠️ Esto borra <b>todo</b> lo tuyo: cartera, historial, lista, alertas, meta, avisos y plan Pro. No se puede deshacer.",
                     [[btn("🗑 Sí, borrar todo", "/borrar_mis_datos si"), btn("Cancelar", "/start")]])
     k = str(chat)
-    for key in ("prefs", "port", "watch", "goals", "pro"):
-        state[key].pop(k, None)
+    for key in ("prefs", "port", "watch", "goals", "pro", "hist"):
+        state.get(key, {}).pop(k, None)
     state["stats"]["seen"].pop(k, None)
     if chat in state["subs"]:
         state["subs"].remove(chat)
@@ -1545,7 +1661,7 @@ def cmd_estadisticas(state, chat, args):
                f"Activas en 24 h: {sum(1 for t in seen if now - t < 86400)} · en 7 días: {sum(1 for t in seen if now - t < 604800)}\n"
                f"Suscritas a avisos: {len(state['subs'])}\n"
                f"Con cartera: {len(state['port'])} · Con alertas: {len({a['chat'] for a in state['alerts']})}\n"
-               f"Con plan Pro: {sum(1 for t in state['pro'].values() if t > now)}\n\n"
+               f"Con plan Pro: {sum(1 for t in state['pro'].values() if t > now)} · Bloqueadas: {len(state.get('blocked', []))}\n\n"
                "<b>Comandos más usados</b>\n" + ("\n".join(f"{c} · {n}" for c, n in top) or "aún nada"))
 
 
@@ -1560,7 +1676,7 @@ def p2p_side(fiat, side):
             "proMerchantAds": False, "shieldMerchantAds": False, "publisherType": None, "payTypes": []}
     rows = []
     try:
-        r = SESSION.post(P2P_URL, json=body, timeout=15, headers=UA)
+        r = SESSION.post(P2P_URL, json=body, timeout=8, headers=UA)
         if r.status_code == 200:
             rows = r.json().get("data") or []
         else:
@@ -1574,6 +1690,7 @@ def p2p_side(fiat, side):
         except (KeyError, TypeError, ValueError):
             pass
     if not vals:
+        _cache[key] = (time.time() - 60, None)   # falló: no reintenta durante 1 minuto
         return None
     top = vals[:5]
     out = {"avg": sum(top) / len(top), "best": vals[0], "n": len(vals)}
@@ -2021,6 +2138,130 @@ def cmd_tarjeta(state, chat, args):
                "\n⚠️ No es consejo financiero.")
 
 
+# ------------------------- historial de cartera y copias -------------------------
+def record_point(state, chat, value):
+    """Asegura que hoy haya un punto en el historial de la cartera de este usuario (hora de Venezuela)."""
+    if value <= 0:
+        return
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    pts = state.setdefault("hist", {}).setdefault(str(chat), [])
+    if not pts or pts[-1][0] != today:
+        pts.append([today, round(value, 2)])
+        del pts[:-90]
+
+
+def task_history(state):
+    """Una vez al día guarda el valor de cada cartera."""
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    if state.get("hist_day") == today:
+        return
+    pr = prices()
+    if not pr:   # sin precios no se marca el día: se reintenta
+        return
+    for k, hold in state["port"].items():
+        if hold:
+            record_point(state, k, sum(h["qty"] * pr[b]["price"] for b, h in hold.items() if b in pr))
+    state["hist_day"] = today
+
+
+def chart_history(points):
+    ys = [v for _, v in points]
+    col = "#2ecc71" if ys[-1] >= ys[0] else "#e74c3c"
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig.patch.set_facecolor(BG)
+    ax.plot(range(len(ys)), ys, color=col, linewidth=2)
+    ax.fill_between(range(len(ys)), ys, min(ys) * 0.98, color=col, alpha=0.15)
+    step = max(1, len(points) // 6)
+    idx = list(range(0, len(points), step))
+    ax.set_xticks(idx)
+    ax.set_xticklabels([f"{points[i][0][8:10]}/{points[i][0][5:7]}" for i in idx])
+    ax.set_title("Valor de tu cartera (USD)", color=FG)
+    _style(ax)
+    return to_png(fig)
+
+
+def cmd_historial(state, chat, args):
+    k = str(chat)
+    hold = state["port"].get(k) or {}
+    if not hold:
+        return send(chat, "No tienes cartera todavía. Agrega monedas con /agregar BTC 0.01 65000 y vuelve mañana.")
+    pr = prices()
+    if pr:
+        record_point(state, chat, sum(h["qty"] * pr[b]["price"] for b, h in hold.items() if b in pr))
+    try:
+        n = max(7, min(90, int(args[0]))) if args else 30
+    except ValueError:
+        n = 30
+    pts = (state.get("hist", {}).get(k) or [])[-n:]
+    if len(pts) < 2:
+        return send(chat, "📈 Empecé a guardar el valor de tu cartera hoy (una vez al día). Vuelve mañana y verás tu historial.")
+    first, last_ = pts[0][1], pts[-1][1]
+    ch = (last_ / first - 1) * 100
+    vals = [v for _, v in pts]
+    send_photo(chat, chart_history(pts),
+               f"📈 <b>Tu cartera, últimos {len(pts)} días</b>\nInicio ${first:,.2f} → hoy ${last_:,.2f} "
+               f"({'🟢' if ch >= 0 else '🔴'} {ch:+.1f}%)\nMáximo ${max(vals):,.2f} · mínimo ${min(vals):,.2f}\n"
+               "Ojo: el valor también cambia cuando agregas o quitas monedas.",
+               [[btn("💼 Cartera", "/cartera"), btn("🎯 Meta", "/meta")]])
+
+
+def cmd_respaldos(state, chat, args):
+    if not OWNER_ID or chat != OWNER_ID:
+        return send(chat, "Este comando es solo para el administrador.")
+    if not REMOTE:
+        return send(chat, "Las copias diarias se guardan en Supabase, y este bot no está usando Supabase.")
+    days = remote_backups()
+    if days is None:
+        return send(chat, "No pude leer las copias ahora. Revisa /estado.")
+    send(chat, "🗄 <b>Copias de seguridad</b> (cifradas, una por día)\n"
+               + ("\n".join("• " + d for d in days) or "Aún no hay copias: se crea la primera al guardar hoy.")
+               + "\n\n<b>Para restaurar una:</b>\n1) En Render, suspende el servicio cripdex.\n"
+                 "2) En Supabase → SQL Editor ejecuta:\n"
+                 "<code>update bot_state set data = (select data from bot_state where id = 'backup-AAAA-MM-DD') where id = 'main';</code>\n"
+                 "3) Vuelve a activar el servicio en Render.")
+
+
+def cmd_bloquear(state, chat, args):
+    if not OWNER_ID or chat != OWNER_ID:
+        return send(chat, "Este comando es solo para el administrador.")
+    try:
+        uid = int(args[0])
+        assert uid > 0 and uid != OWNER_ID
+    except Exception:
+        return send(chat, "Uso: /bloquear ID  (el ID lo ve la persona con /miid). Para quitarlo: /desbloquear ID")
+    bl = state.setdefault("blocked", [])
+    if uid not in bl:
+        bl.append(uid)
+    if uid in state["subs"]:
+        state["subs"].remove(uid)
+    state["alerts"] = [a for a in state["alerts"] if a["chat"] != uid]
+    send(chat, f"⛔ {uid} bloqueado: el bot ya no le responde y se quitaron sus avisos y alertas.")
+
+
+def cmd_desbloquear(state, chat, args):
+    if not OWNER_ID or chat != OWNER_ID:
+        return send(chat, "Este comando es solo para el administrador.")
+    try:
+        uid = int(args[0])
+    except Exception:
+        return send(chat, "Uso: /desbloquear ID")
+    bl = state.setdefault("blocked", [])
+    if uid in bl:
+        bl.remove(uid)
+    send(chat, f"✅ {uid} desbloqueado.")
+
+
+def cmd_publicar(state, chat, args):
+    """Solo administrador: publica ahora el resumen en tu canal (para probarlo sin esperar a las 8:00)."""
+    if not OWNER_ID or chat != OWNER_ID:
+        return send(chat, "Este comando es solo para el administrador.")
+    if not CHANNEL_ID:
+        return send(chat, "Aún no configuraste el canal. En Render agrega la variable CHANNEL_ID con el @usuario de tu canal.")
+    text, png = daily_content()
+    channel_post(text, png)
+    send(chat, "✅ Lo publiqué en tu canal. Si no lo ves, revisa que el bot sea administrador del canal con permiso para publicar.")
+
+
 def cmd_miid(state, chat, args):
     send(chat, f"Tu ID de Telegram es <code>{chat}</code>.\nPónlo en Render como OWNER_ID para recibir avisos de salud.")
 
@@ -2039,6 +2280,7 @@ def cmd_estado(state, chat, args):
                f"Carteras guardadas: {len(state['port'])}\n"
                f"Alertas de precio: {len(state['alerts'])}\n"
                f"Último guardado en la nube: {ago}\n"
+               f"Última copia diaria: {HEALTH.get('last_backup') or 'ninguna aún'}\n"
                f"Fallos de guardado seguidos: {HEALTH['save_fail_streak']}\n"
                f"Último error: {esc(HEALTH['last_error']) or 'ninguno'}\n"
                f"Errores en tareas automáticas: {HEALTH['task_errors']}")
@@ -2058,13 +2300,15 @@ COMMANDS = {"/start": cmd_start, "/menu": cmd_start, "/ayuda": cmd_ayuda, "/help
             "/p2p": cmd_p2p, "/futuros": cmd_futuros, "/contrato": cmd_contrato, "/glosario": cmd_glosario,
             "/meta": cmd_meta, "/tarjeta": cmd_tarjeta, "/pro": cmd_pro, "/darpro": cmd_darpro,
             "/terminos": cmd_terminos, "/borrar_mis_datos": cmd_borrar_mis_datos,
-            "/estadisticas": cmd_estadisticas}
+            "/estadisticas": cmd_estadisticas, "/historial": cmd_historial, "/respaldos": cmd_respaldos,
+            "/alertarsi": cmd_alertarsi, "/bloquear": cmd_bloquear, "/desbloquear": cmd_desbloquear,
+            "/publicar": cmd_publicar}
 
 NATURAL = {"precio": "/precio", "grafico": "/grafico", "gráfico": "/grafico", "analisis": "/analisis",
            "análisis": "/analisis", "comparar": "/comparar", "top": "/top", "mercado": "/mercado",
            "noticias": "/noticias", "memes": "/memes", "cartera": "/cartera", "ayuda": "/ayuda",
            "menu": "/start", "menú": "/start", "p2p": "/p2p", "futuros": "/futuros", "glosario": "/glosario",
-           "heatmap": "/heatmap", "escaner": "/escaner", "escáner": "/escaner", "contrato": "/contrato"}
+           "heatmap": "/heatmap", "escaner": "/escaner", "escáner": "/escaner", "contrato": "/contrato", "historial": "/historial"}
 
 _hits = {}
 
@@ -2089,7 +2333,7 @@ def natural(chat, text):
 
 def handle(state, chat, text):
     text = text.strip()
-    if not text:
+    if not text or chat in state.get("blocked", []):
         return
     now = time.time()
     _hits[chat] = [t for t in _hits.get(chat, []) if now - t < 60] + [now]
@@ -2124,16 +2368,32 @@ def handle(state, chat, text):
 
 
 # ------------------------- tareas automaticas -------------------------
+def alert_step(a, p):
+    """Con el valor actual p decide: (¿avisar ahora?, ¿mantener la alerta?). Las que se repiten se rearman al volver atrás."""
+    cond = p is not None and ((a["dir"] == "up" and p >= a["price"]) or (a["dir"] == "down" and p <= a["price"]))
+    if a.get("repeat"):
+        if cond and a.get("armed", True):
+            a["armed"] = False
+            return True, True
+        if p is not None and not cond:
+            a["armed"] = True
+        return False, True
+    return cond, not cond
+
+
 def task_alerts(state):
     if not state["alerts"]:
         return
     pr = {}
-    if any(not a["sym"].startswith("P2P:") for a in state["alerts"]):
+    if any(not a["sym"].startswith(("P2P:", "RSI:")) for a in state["alerts"]):
         d = get(f"{DATA}/api/v3/ticker/price")
         if d:
             pr = {x["symbol"]: float(x["price"]) for x in d}
     mids, keep = {}, []
     for a in state["alerts"]:
+        if a["sym"].startswith("RSI:"):   # las del RSI las revisa task_rsi_alerts
+            keep.append(a)
+            continue
         if a["sym"].startswith("P2P:"):
             fiat = a["sym"][4:]
             if fiat not in mids:
@@ -2141,17 +2401,41 @@ def task_alerts(state):
             p = mids[fiat]
         else:
             p = pr.get(a["sym"])
-        hit = p is not None and ((a["dir"] == "up" and p >= a["price"]) or (a["dir"] == "down" and p <= a["price"]))
-        if hit:
+        fire, stay = alert_step(a, p)
+        if fire:
             if a["sym"].startswith("P2P:"):
                 send(a["chat"], f"🔔 <b>USDT en {a['sym'][4:]}</b> (P2P) llegó a {p:,.2f} (tu alerta: {a['price']:,.2f})",
                      [[btn("💵 Ver P2P", f"/p2p {a['sym'][4:]}")]])
             else:
                 send(a["chat"], f"🔔 <b>{a['sym'][:-4]}</b> llegó a ${fp(p)} (tu alerta: ${fp(a['price'])})",
                      [[btn("📊 Gráfico", f"/grafico {a['sym'][:-4]} 1h")]])
-        else:
+        if stay:
             keep.append(a)
     state["alerts"] = keep
+
+
+def task_rsi_alerts(state):
+    mine = [a for a in state["alerts"] if a["sym"].startswith("RSI:")]
+    if not mine:
+        return
+    vals, keep_ids = {}, set()
+    for a in mine:
+        _, sym_, iv = a["sym"].split(":")
+        if (sym_, iv) not in vals:
+            if len(vals) >= 60:   # tope por ciclo para cuidar la CPU del hosting gratis
+                keep_ids.add(a["id"])
+                continue
+            kl = klines(sym_, iv, 100)
+            vals[(sym_, iv)] = rsi([k["c"] for k in kl]) if kl else None
+        p = vals[(sym_, iv)]
+        fire, stay = alert_step(a, p)
+        if fire:
+            send(a["chat"], f"🔔 El RSI de <b>{sym_[:-4]}</b> ({iv}) llegó a {p:.0f} (tu alerta: {a['price']:g}). "
+                 + ("Está muy comprada: puede corregir." if p >= 70 else "Está muy vendida: puede rebotar." if p <= 30 else ""),
+                 [[btn("🧠 Análisis", f"/analisis {sym_[:-4]} {iv}")]])
+        if stay:
+            keep_ids.add(a["id"])
+    state["alerts"] = [a for a in state["alerts"] if not a["sym"].startswith("RSI:") or a["id"] in keep_ids]
 
 
 def task_movers(state):
@@ -2216,14 +2500,21 @@ def task_memes(state):
             sent += 1
 
 
-def task_daily(state):
-    now = datetime.now(timezone.utc)
-    today = now.strftime("%Y-%m-%d")
-    if not (DAILY_HOUR_UTC <= now.hour < 23) or state.get("daily") == today:
+def channel_post(text, png):
+    """Publica el resumen diario en tu canal (variable CHANNEL_ID). El bot debe ser administrador del canal."""
+    if not CHANNEL_ID:
         return
-    if not any(pref(state, c)["daily"] for c in state["subs"]):
-        state["daily"] = today
-        return
+    if png:
+        send_photo(CHANNEL_ID, png, "")
+    rows = [[btn("🤖 Abrir el bot", url=f"https://t.me/{BOT['user']}")]] if BOT["user"] else None
+    r = send(CHANNEL_ID, text, rows)
+    if r.get("ok") is False:
+        notify_owner("channel", "⚠️ No pude publicar en el canal: " + esc(str(r.get("description", ""))[:150])
+                     + "\nRevisa que el bot sea administrador del canal y que CHANNEL_ID esté bien.")
+
+
+def daily_content():
+    """Texto y gráfico del resumen diario (el mismo para suscriptores y canal)."""
     mk = market()
     parts = ["🌅 <b>Resumen del día</b>\n", market_summary()]
     if DAILY_P2P_FIAT:
@@ -2245,7 +2536,20 @@ def task_daily(state):
     parts.append(f"\n💡 <b>Término del día: {esc(t[0])}</b>\n{esc(t[1])}")
     parts.append("\n" + DISCLAIMER)
     png = chart_heatmap(sorted(mk, key=lambda x: x["qv"], reverse=True)[:30]) if mk else None
-    broadcast(state, "daily", "\n".join(parts), [[btn("📈 Top", "/top"), btn("🔍 Escáner", "/escaner")]], photo=png)
+    return "\n".join(parts), png
+
+
+def task_daily(state):
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    if not (DAILY_HOUR_UTC <= now.hour < 23) or state.get("daily") == today:
+        return
+    if not any(pref(state, c)["daily"] for c in state["subs"]) and not CHANNEL_ID:
+        state["daily"] = today
+        return
+    text, png = daily_content()
+    broadcast(state, "daily", text, [[btn("📈 Top", "/top"), btn("🔍 Escáner", "/escaner")]], photo=png)
+    channel_post(text, png)
     state["daily"] = today
 
 
@@ -2253,7 +2557,7 @@ def run_tasks(state):
     now = time.time()
     for name, every, fn in (("alerts", 30, task_alerts), ("movers", 120, task_movers),
                             ("memes", 300, task_memes), ("vol", 600, task_volumen),
-                            ("daily", 300, task_daily)):
+                            ("daily", 300, task_daily), ("hist", 600, task_history), ("rsi", 300, task_rsi_alerts)):
         if now - state["last"].get(name, 0) >= every:
             state["last"][name] = now
             try:
